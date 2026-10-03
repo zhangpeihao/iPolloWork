@@ -1,3 +1,34 @@
+name: Sync Fork Upstream
+on:
+  schedule:
+    - cron: '0 0 * * *'  # UTC 0点 = 北京时间早8点，每日执行
+  workflow_dispatch: # 网页手动触发
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout your repo
+        uses: aormsby/Fork-Sync-With-Upstream-action@v3.4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sync upstream
+        env:
+          UPSTREAM_REPO: Devin-AXIS/iPolloWork # 例: vuejs/vue
+          TARGET_BRANCH: main
+          UPSTREAM_BRANCH: main
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/${UPSTREAM_REPO}.git
+          git fetch upstream
+          git checkout ${TARGET_BRANCH}
+          git merge upstream/${UPSTREAM_BRANCH} --no-edit
+          git push origin ${TARGET_BRANCH}
+
+
 name: Sync Fork with Upstream
 on:
   schedule:
