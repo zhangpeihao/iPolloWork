@@ -21,7 +21,6 @@ jobs:
       - name: Sync upstream
         env:
           UPSTREAM_REPO: Devin-AXIS/iPolloWork
-          TARGET_BRANCH: main
-          UPSTREAM_BRANCH: main
+          BRANCH: main
         run: |
           gh repo sync $UPSTREAM_REPO --branch $BRANCH
