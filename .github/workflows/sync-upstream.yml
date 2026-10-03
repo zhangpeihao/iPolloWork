@@ -1,8 +1,12 @@
 name: Sync Fork Upstream
 on:
   schedule:
-    - cron: '0 0 * * *'  # UTC 0点 = 北京时间早8点，每日执行
-  workflow_dispatch: # 网页手动触发
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+# 授予写权限，必须
+permissions:
+  contents: write
 
 jobs:
   sync:
@@ -12,18 +16,24 @@ jobs:
         uses: aormsby/Fork-Sync-With-Upstream-action@v3.4
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: false # 关闭默认凭证，防止冲突
 
       - name: Sync upstream
         env:
-          UPSTREAM_REPO: Devin-AXIS/iPolloWork # 例: vuejs/vue
+          UPSTREAM_REPO: Devin-AXIS/iPolloWork
           TARGET_BRANCH: main
           UPSTREAM_BRANCH: main
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git remote add upstream https://github.com/${UPSTREAM_REPO}.git
+          # 存在就修改url，不存在就新增，解决remote already exists
+          git remote set-url upstream https://github.com/${UPSTREAM_REPO}.git 2>/dev/null || git remote add upstream https://github.com/${UPSTREAM_REPO}.git
           git fetch upstream
           git checkout ${TARGET_BRANCH}
-          git merge upstream/${UPSTREAM_BRANCH} --no-edit
-          git push origin ${TARGET_BRANCH}
+          if git merge upstream/${UPSTREAM_BRANCH} --no-edit; then
+            git push origin ${TARGET_BRANCH}
+            echo "✅ Sync success"
+          else
+            echo "❌ Merge conflict! Cannot auto sync, please resolve manually."
+            exit 1
+          fi
