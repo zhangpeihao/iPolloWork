@@ -27,26 +27,3 @@ jobs:
           git checkout ${TARGET_BRANCH}
           git merge upstream/${UPSTREAM_BRANCH} --no-edit
           git push origin ${TARGET_BRANCH}
-
-
-name: Sync Fork with Upstream
-on:
-  schedule:
-    - cron: '0 0 * * *'
-  workflow_dispatch:
-
-jobs:
-  sync:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Sync upstream
-        uses: aormsby/Fork-Sync-With-Upstream-action@v2
-        with:
-          upstream_repository: Devin-AXIS/iPolloWork
-          target_branch: main
-          upstream_branch: main
