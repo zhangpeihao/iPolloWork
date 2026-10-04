@@ -4,7 +4,6 @@ on:
     - cron: '0 0 * * *'
   workflow_dispatch:
 
-# 授予写权限，必须
 permissions:
   contents: write
 
@@ -12,15 +11,10 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout your repo
-        uses: aormsby/Fork-Sync-With-Upstream-action@v3.4
-        with:
-          fetch-depth: 0
-          persist-credentials: false # 关闭默认凭证，防止冲突
-
       - name: Sync upstream
         env:
-          UPSTREAM_REPO: Devin-AXIS/iPolloWork
-          BRANCH: main
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh repo sync $UPSTREAM_REPO --branch $BRANCH
+          gh repo sync ${{ github.repository }} \
+            --source Devin-AXIS/iPolloWork \
+            --branch main
