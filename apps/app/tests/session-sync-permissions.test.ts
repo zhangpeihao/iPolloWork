@@ -10,7 +10,7 @@ import type {
   ConversationSnapshot,
 } from "../src/react-app/domains/session/engine/conversation-engine";
 import { mapOpenCodeConversationEvent } from "../src/react-app/domains/session/engine/opencode-conversation-mapper";
-import { createInternalContinuationMessageId, deriveRenderedSessionMessages } from "../src/react-app/domains/session/surface/session-render-state";
+import { deriveRenderedSessionMessages } from "../src/react-app/domains/session/surface/session-render-state";
 import { useSessionActivityStore } from "../src/react-app/domains/session/status/session-activity-store";
 import {
   __applySessionSyncEventForTest,
@@ -142,6 +142,45 @@ function snapshotWithMessages(
 }
 
 const syncInput = { workspaceId: "workspace-a", connectionKey: "test" };
+describe("session context compaction sync", () => {
+  test("updates assistant usage without replacing the snapshot session or run state", () => {
+    const cleanup = __createWorkspaceSessionSyncForTest(syncInput);
+    const release = trackWorkspaceSessionSync(syncInput, "session-a");
+    const query = getReactQueryClient();
+    query.setQueryData(snapshotKey("workspace-a", "session-a"), snapshotWithMessages([]));
+    const original = query.getQueryData<ConversationSnapshot>(snapshotKey("workspace-a", "session-a"))!;
+    try {
+      __applySessionSyncEventForTest(syncInput, { type: "session.compaction", sessionId: "session-a", running: true });
+      __applySessionSyncEventForTest(syncInput, {
+        type: "message.upsert", sessionId: "session-a",
+        message: { ...uiMessage("summary", "assistant", "Summary"), metadata: { ipollowork: { contextUsage: { usedTokens: 420, contextWindow: 128000 } } } },
+      });
+      const updated = query.getQueryData<ConversationSnapshot>(snapshotKey("workspace-a", "session-a"))!;
+      expect(updated.contextUsage).toEqual({ usedTokens: 420, contextWindow: 128000 });
+      expect(updated.session).toBe(original.session);
+      expect(updated.messages).toBe(original.messages);
+      expect(updated.status).toBe(original.status);
+      expect(useSessionActivityStore.getState().getStatus("workspace-a", "session-a")).toBe("compacting");
+      expect(query.getQueryData<UIMessage[]>(transcriptKey("workspace-a", "session-a"))?.[0]?.id).toBe("summary");
+    } finally { release(); cleanup(); }
+  });
+
+  test("refreshes only the selected snapshot after native compaction finishes", () => {
+    const cleanup = __createWorkspaceSessionSyncForTest(syncInput);
+    const release = trackWorkspaceSessionSync(syncInput, "session-a");
+    const query = getReactQueryClient();
+    query.setQueryData(snapshotKey("workspace-a", "session-a"), snapshotWithMessages([]));
+    query.setQueryData(snapshotKey("workspace-a", "session-b"), snapshotWithMessages([], "session-b"));
+    try {
+      __applySessionSyncEventForTest(syncInput, { type: "session.compaction", sessionId: "session-a", running: true });
+      expect(query.getQueryState(snapshotKey("workspace-a", "session-a"))?.isInvalidated).toBe(false);
+      __applySessionSyncEventForTest(syncInput, { type: "session.compaction", sessionId: "session-a", running: false });
+      expect(query.getQueryState(snapshotKey("workspace-a", "session-a"))?.isInvalidated).toBe(true);
+      expect(query.getQueryState(snapshotKey("workspace-a", "session-b"))?.isInvalidated).toBe(false);
+      expect(useSessionActivityStore.getState().getStatus("workspace-a", "session-a")).toBe("idle");
+    } finally { release(); cleanup(); }
+  });
+});
 test("repairs legacy client-only reconnect errors but preserves authoritative and terminal errors", () => {
   const retry = uiMessage("session-error:retry", "assistant", "Reconnecting... waiting for network");
   const failure = uiMessage("session-error:failure", "assistant", "Unauthorized");
@@ -538,20 +577,13 @@ describe("session transcript sync", () => {
     ]);
   });
 
-  test("hides host-owned continuation prompts while retaining their assistant work", () => {
-    expect(createInternalContinuationMessageId()).toMatch(/^msg_ipollowork_internal_continuation_/);
+  test("shows persisted native user and assistant messages without text-based hiding", () => {
     const snapshot = snapshotWithMessages([
-      { id: "msg-user", role: "user", text: "生成视频并发布到视频号" },
-      { id: "ipollowork-internal-continuation-1", role: "user", text: "Continue the unfinished task from its saved progress and complete the requested result." },
-      { id: "msg_ipollowork_internal_continuation_1", role: "user", text: "Continue the unfinished task from its saved progress and complete the requested result." },
-      { id: "msg-assistant-repair", role: "assistant", text: "正在修复并保存视频。" },
-      { id: "legacy-recovery", role: "user", text: "Continue the unfinished video delivery." },
+      { id: "msg-user", role: "user", text: "Continue the unfinished video delivery." },
+      { id: "msg-assistant", role: "assistant", text: "继续完成视频。" },
     ]);
-
-    expect(deriveRenderedSessionMessages({ transcriptState: null, snapshot }).map((message) => message.id)).toEqual([
-      "msg-user",
-      "msg-assistant-repair",
-    ]);
+    expect(deriveRenderedSessionMessages({ transcriptState: null, snapshot }).map((message) => message.id))
+      .toEqual(["msg-user", "msg-assistant"]);
   });
 
   test("replaces an optimistic user prompt when an OpenCode event confirms the same text", () => {

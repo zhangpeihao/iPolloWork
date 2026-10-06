@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { existsSync } from "node:fs";
-import { cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   serializeSharedProviderProfile,
@@ -26,6 +28,7 @@ import {
   mapCodexMessages,
   mapCodexThread,
   readCodexHarnessSnapshot,
+  type CodexThread,
 } from "./codex-harness-session-read-model.js";
 import { CodexProviderGateway } from "./codex-provider-gateway.js";
 import { deepSeekHarnessProviderCredentials } from "./deepseek-harness-runtime.js";
@@ -39,6 +42,7 @@ import {
 import { StdioJsonRpcProcess } from "./stdio-json-rpc-runtime.js";
 import { buildCodexHarnessAdditionalContext } from "./workspace-session-runtime.js";
 import { disposeRuntimeOpencodeConfigStore } from "./runtime-opencode-config-store.js";
+import { installPluginPackage, reconcilePluginPackagesForWorkspace } from "./plugin-package-lifecycle.js";
 import type { ServerConfig, WorkspaceInfo } from "./types.js";
 
 const roots: string[] = [];
@@ -90,6 +94,133 @@ afterEach(async () => {
 });
 
 describe("Codex Harness provider projection", () => {
+  test("recovers native totals in a read-only workspace batch without starting Codex or inventing zero usage", async () => {
+    const config = await testConfig();
+    if (!config.configPath) throw new Error("Test config path is required");
+    const root = dirname(config.configPath);
+    const env = new EnvService({ path: join(root, "env.json") });
+    const workspace: WorkspaceInfo = { id: "metered", name: "Metered", path: root, preset: "starter", workspaceType: "local", engineId: "codex-harness" };
+    const nativeHome = join(root, "codex-harness-workspaces", workspace.id);
+    const path = join(nativeHome, "state_5.sqlite");
+    await mkdir(nativeHome, { recursive: true });
+    const db = new Database(path);
+    db.exec("CREATE TABLE threads (id TEXT PRIMARY KEY, tokens_used INTEGER NOT NULL DEFAULT 0)");
+    const insert = db.prepare("INSERT INTO threads (id, tokens_used) VALUES (?, ?)");
+    for (const [id, tokens] of [["root", 3649058], ["child", 198265], ["other", 100], ["unmetered", 0], ["invalid", -1]]) insert.run(id, tokens);
+    insert.finalize();
+    db.close();
+    const before = await readFile(path);
+    const runtime = new CodexHarnessRuntime({ config, env, workspace });
+    const ids = ["root", "child", "unmetered", "invalid", "missing", "root"];
+    expect(await runtime.readTokenTotals(ids)).toEqual(new Map([["child", 198265], ["root", 3649058]]));
+    const restored = new CodexHarnessRuntime({ config, env, workspace });
+    expect(await restored.readTokenTotals(ids)).toEqual(await runtime.readTokenTotals(ids));
+    expect(await readFile(path)).toEqual(before);
+
+    const isolated = new CodexHarnessRuntime({ config, env, workspace: { ...workspace, id: "other-workspace" } });
+    expect(await isolated.readTokenTotals(ids)).toEqual(new Map());
+    expect(existsSync(join(root, "codex-harness-workspaces", "other-workspace"))).toBe(false);
+    // A future native schema cannot make session reads fail or turn unknown usage into zero.
+    const changedHome = join(root, "codex-harness-workspaces", "changed-schema");
+    await mkdir(changedHome);
+    const changed = new Database(join(changedHome, "state_5.sqlite"));
+    changed.exec("CREATE TABLE threads (id TEXT PRIMARY KEY)");
+    changed.close();
+    const unsupported = new CodexHarnessRuntime({ config, env, workspace: { ...workspace, id: "changed-schema" } });
+    expect(await unsupported.readTokenTotals(ids)).toEqual(new Map());
+  });
+
+  test("waits for native compaction completion, rejects active tasks and propagates failure or disconnect", async () => {
+    const config = await testConfig();
+    if (!config.configPath) throw new Error("Test config path is required");
+    const root = dirname(config.configPath);
+    const fixturePath = join(root, "codex-compaction-fixture.js");
+    await writeFile(fixturePath, String.raw`
+const readline = require("node:readline");
+const emit = value => process.stdout.write(JSON.stringify(value) + "\n");
+let starts = 0;
+let resumes = 0;
+readline.createInterface({ input: process.stdin }).on("line", line => {
+  const message = JSON.parse(line);
+  const params = message.params || {};
+  if (message.method === "initialized") return;
+  if (message.method === "thread/read") {
+    emit({ id: message.id, result: { thread: { id: params.threadId, status: { type: params.threadId === "active" ? "active" : params.threadId === "unloaded" ? "notLoaded" : "idle" } } } });
+    return;
+  }
+  if (message.method === "thread/resume") resumes += 1;
+  if (message.method === "thread/compact/start") {
+    if (params.threadId === "rpc-error") { emit({ id: message.id, error: { code: -32602, message: "Cannot compact this thread" } }); return; }
+    starts += 1;
+    emit({ id: message.id, result: {} });
+    emit({ method: "turn/started", params: { threadId: params.threadId, turn: { id: "compact-turn" } } });
+    emit({ method: "item/started", params: { threadId: params.threadId, turnId: "compact-turn", item: { id: "compact-item", type: "contextCompaction" } } });
+    return;
+  }
+  if (message.method === "test/finish") {
+    const turnId = params.turnId || "compact-turn";
+    if (params.status === "completed") emit({ method: "item/completed", params: { threadId: params.threadId, turnId, item: { id: "compact-item", type: "contextCompaction" } } });
+    emit({ method: "turn/completed", params: { threadId: params.threadId, turn: { id: turnId, status: params.status, error: params.status === "failed" ? { message: "Native compaction failed" } : null } } });
+  }
+  emit({ id: message.id, result: { starts, resumes } });
+});
+`, "utf8");
+    const previousCli = process.env.IPOLLOWORK_CODEX_CLI;
+    process.env.IPOLLOWORK_CODEX_CLI = fixturePath;
+    const runtime = new CodexHarnessRuntime({ config, env: new EnvService({ path: join(root, "env.json") }), workspace: {
+      id: "compaction", name: "Compaction", path: root, preset: "starter", workspaceType: "local", engineId: "codex-harness",
+    } });
+    const eventController = new AbortController();
+    try {
+      const response = await runtime.events(eventController.signal);
+      if (!response.body) throw new Error("Missing native event stream");
+      const reader = response.body.getReader();
+      const started = async (threadId: string) => {
+        while (true) {
+          const chunk = await reader.read();
+          if (chunk.done) throw new Error("Native stream closed before compaction started");
+          const event = JSON.parse(new TextDecoder().decode(chunk.value).slice(6).trim());
+          if (event.method === "item/started" && event.params.threadId === threadId) return;
+        }
+      };
+      await expect(runtime.compactThread("active", new AbortController().signal)).rejects.toThrow("current task to finish");
+      expect(await runtime.call<{ starts: number; resumes: number }>("test/counts")).toEqual({ starts: 0, resumes: 0 });
+      let settled = false;
+      const success = runtime.compactThread("unloaded", new AbortController().signal).then(() => { settled = true; });
+      await started("unloaded");
+      expect(settled).toBe(false);
+      expect(await runtime.call<{ starts: number; resumes: number }>("test/counts")).toEqual({ starts: 1, resumes: 1 });
+      await runtime.call("test/finish", { threadId: "unloaded", turnId: "unrelated-turn", status: "completed" });
+      expect(settled).toBe(false);
+      await runtime.call("test/finish", { threadId: "unloaded", status: "completed" });
+      await success;
+      expect(settled).toBe(true);
+
+      const failure = runtime.compactThread("failed", new AbortController().signal).catch((error: unknown) => error);
+      await started("failed");
+      await runtime.call("test/finish", { threadId: "failed", status: "failed" });
+      expect(await failure).toMatchObject({ message: "Native compaction failed" });
+      await expect(runtime.compactThread("rpc-error", new AbortController().signal)).rejects.toThrow("Cannot compact this thread");
+
+      const disconnect = new AbortController();
+      const interrupted = runtime.compactThread("disconnected", disconnect.signal).catch((error: unknown) => error);
+      await started("disconnected");
+      disconnect.abort();
+      expect(await interrupted).toMatchObject({ message: "Codex context compaction request was disconnected" });
+      await runtime.call("test/finish", { threadId: "disconnected", status: "completed" });
+      const aborted = new AbortController();
+      aborted.abort();
+      await expect(runtime.compactThread("already-aborted", aborted.signal)).rejects.toThrow();
+      expect(await runtime.call<{ starts: number; resumes: number }>("test/counts")).toEqual({ starts: 3, resumes: 1 });
+      reader.releaseLock();
+    } finally {
+      eventController.abort();
+      await runtime.close();
+      if (previousCli === undefined) delete process.env.IPOLLOWORK_CODEX_CLI;
+      else process.env.IPOLLOWORK_CODEX_CLI = previousCli;
+    }
+  }, 20_000);
+
   test("replays unresolved approvals and questions on reconnect without approving or reviving resolved requests", async () => {
     const config = await testConfig();
     if (!config.configPath) throw new Error("Test config path is required");
@@ -105,6 +236,8 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
   if (message.method === "initialized") return;
   if (message.method === "test/emit") for (const event of message.params.events) emit(event);
   if (message.method === "test/marker") emit({ method: "test/marker", params: {} });
+if (message.method === "thread/read") { emit({ id: message.id, result: { thread: { id: message.params.threadId } } }); return; }
+if (message.method === "thread/list") { emit({ id: message.id, result: { data: [{ id: "metered-root" }, { id: "metered-child" }, { id: "unmetered" }] } }); return; }
   emit({ id: message.id, result: { replies } });
 });
 `, "utf8");
@@ -134,6 +267,39 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
     const approval = { id: 1, method: "item/commandExecution/requestApproval", params: { threadId: "thread-a", turnId: "turn-a", command: "read brief" } };
     const question = { id: "question-2", method: "item/tool/requestUserInput", params: { threadId: "thread-b", turnId: "turn-b", questions: [] } };
     try {
+      const usage = (threadId: string, total: number) => ({ method: "thread/tokenUsage/updated", params: { threadId, tokenUsage: {
+        total: { totalTokens: total, inputTokens: 900, cachedInputTokens: 700, outputTokens: 100, reasoningOutputTokens: 50 },
+        last: { totalTokens: 10 },
+      } } });
+      await emit([usage("metered-root", 1000), usage("metered-root", 1000), usage("metered-child", 200)]);
+      expect(await runtime.readTokenTotals(["metered-root", "metered-child", "unmetered"]))
+        .toEqual(new Map([["metered-root", 1000], ["metered-child", 200]]));
+      expect(await runtime.call<{ data: Array<{ id: string; totalTokens?: number }> }>("thread/list")).toEqual({ data: [
+        { id: "metered-root", totalTokens: 1000 }, { id: "metered-child", totalTokens: 200 }, { id: "unmetered" },
+      ] });
+      expect(await runtime.call<{ thread: { id: string; totalTokens?: number } }>("thread/read", { threadId: "metered-root" })).toEqual({ thread: { id: "metered-root", totalTokens: 1000 } });
+      await emit([usage("metered-root", 1200), usage("metered-child", -1), usage("measured-zero", 0)]);
+      expect(await runtime.readTokenTotals(["metered-root", "metered-child", "measured-zero"]))
+        .toEqual(new Map([["metered-root", 1200], ["metered-child", 200], ["measured-zero", 0]]));
+      await emit([{ method: "turn/plan/updated", params: { threadId: "planned-thread", turnId: "native-turn", plan: [
+        { step: "Check files", status: "inProgress" }, { step: "Return results", status: "pending" },
+      ] } }]);
+      const nativeHome = join(root, "codex-harness-workspaces", "confirmation-replay");
+      const nativeConfig = await readFile(join(nativeHome, "config.toml"), "utf8");
+      expect(nativeConfig).toContain('[agents."ipw-video.plan"]');
+      expect(nativeConfig).toContain('[agents."ipw-video.produce"]');
+      expect(nativeConfig).toContain('[agents."ipw-video.verify"]');
+      const producer = await readFile(join(nativeHome, "agents", "ipw-video.produce.toml"), "utf8");
+      expect(producer).toContain("developer_instructions = ");
+      expect(producer).toContain('name = "ipw-video.produce"');
+      expect(producer).toContain('description = "视频制作: 画面与合成.');
+      expect(producer).toContain("ipollowork-video-compose");
+      expect(producer).not.toContain("model =");
+      expect(await runtime.call("thread/read", { threadId: "planned-thread" })).toMatchObject({ thread: { nativePlan: {
+        turnId: "native-turn", plan: [{ step: "Check files", status: "inProgress" }, { step: "Return results", status: "pending" }],
+      } } });
+      await emit([{ method: "turn/started", params: { threadId: "planned-thread", turn: { id: "next-turn" } } }]);
+      expect(await runtime.call<{ thread: { id: string } }>("thread/read", { threadId: "planned-thread" })).toEqual({ thread: { id: "planned-thread" } });
       await emit([approval, question]);
       const expected = [{ ...approval, type: "request" as const }, { ...question, type: "request" as const }];
       expect(await readWindow()).toEqual(expected);
@@ -257,15 +423,19 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
   test.skipIf(!process.env.IPOLLOWORK_CODEX_CONTEXT_PROOF_CLI)("native Codex receives every application instruction before model execution", async () => {
     const command = process.env.IPOLLOWORK_CODEX_CONTEXT_PROOF_CLI;
     if (!command) throw new Error("Set IPOLLOWORK_CODEX_CONTEXT_PROOF_CLI to the native Codex binary");
-    const root = await mkdtemp(join(tmpdir(), "ipollowork-context-proof-"));
-    roots.push(root);
-    await cp(new URL("../../../examples/plugin-packages/video-agent/skills/", import.meta.url), join(root, ".agents", "skills"), { recursive: true });
+    const config = await testConfig();
+    const root = dirname(config.configPath!);
+    config.workspaces = [{ id: "video-proof", name: "Video proof", path: root, preset: "starter", workspaceType: "local", engineId: "opencode" }];
+    const packageRoot = fileURLToPath(new URL("../../../examples/plugin-packages/video-agent", import.meta.url));
+    await installPluginPackage({ serverConfig: config, packageRoot });
+    expect(existsSync(join(root, ".agents", "skills"))).toBe(false);
+    expect(config.workspaces[0]?.engineId).toBe("opencode");
     const videoSkills = await Promise.all([
       "ipollowork-video-studio", "ipollowork-video-storyboard", "ipollowork-video-compose",
       "ipollowork-video-voiceover", "ipollowork-video-soundtrack",
     ].map(async (name) => {
       const path = join(root, ".agents", "skills", name, "SKILL.md");
-      const { data, body } = parseFrontmatter(await readFile(path, "utf8"));
+      const { data, body } = parseFrontmatter(await readFile(join(packageRoot, "skills", name, "SKILL.md"), "utf8"));
       if (data.name !== name || typeof data.description !== "string") throw new Error(`Invalid Video Skill metadata: ${name}`);
       const instructions = body.split(/\n\s*\n/).find((paragraph) => paragraph.trim() && !paragraph.trim().startsWith("#"));
       if (!instructions) throw new Error(`Missing Video Skill instructions: ${name}`);
@@ -290,16 +460,33 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
       env: { HOME: root, CODEX_HOME: root, PATH: process.env.PATH } });
     try {
       await runtimeProcess.call("initialize", { clientInfo: { name: "ipollowork-proof", version: "1" }, capabilities: { experimentalApi: true } });
+      const listed = await runtimeProcess.call<{ data: CodexThread[] }>("thread/list", {
+        sourceKinds: ["cli", "vscode", "appServer", "subAgent", "subAgentThreadSpawn"], modelProviders: [], limit: 10,
+      });
+      expect(Array.isArray(listed.data)).toBe(true);
+      const cached = await runtimeProcess.call("skills/list", { cwds: [root] });
+      expect(JSON.stringify(cached)).not.toContain("ipollowork-video-compose");
       const started = await runtimeProcess.call<{ thread: { id: string } }>("thread/start", { cwd: root, modelProvider: "proof", model: "gpt-5.5", approvalPolicy: "never", sandbox: "read-only", ephemeral: true });
+      await reconcilePluginPackagesForWorkspace({ serverConfig: config, workspaceId: "video-proof", workspaceRoot: root, engineId: "codex-harness" });
+      const refreshed = await runtimeProcess.call("skills/list", { cwds: [root], forceReload: true });
+      for (const skill of videoSkills) expect(JSON.stringify(refreshed)).toContain(skill.name);
+      const reference = "skills/ipollowork-video-studio/references/video-compose.md";
+      expect(await readFile(join(root, ".agents", reference), "utf8")).toBe(await readFile(join(packageRoot, reference), "utf8"));
       await runtimeProcess.call("turn/start", { threadId: started.thread.id, input: [{ type: "text", text: "Reply OK.", text_elements: [] }], additionalContext: buildCodexHarnessAdditionalContext(original, []) });
       const body = await received;
       if (!isRecord(body) || !Array.isArray(body.input)) throw new Error("Missing model input");
       const contextText = body.input.flatMap((message) => isRecord(message) && Array.isArray(message.content) ? message.content : [])
         .flatMap((content) => isRecord(content) && typeof content.text === "string" ? [content.text] : []).join("\n");
+      const skillRoots = new Map([...contextText.matchAll(/^- `(r\d+)` = `([^`]+)`$/gmu)]
+        .map((match) => [match[1], match[2]] as const));
+      const expandedCatalog = contextText.replace(/\(file: (r\d+)\/([^)]*)\)/gu,
+        (entry, alias: string, relative: string) => skillRoots.has(alias)
+          ? `(file: ${join(skillRoots.get(alias)!, relative)})`
+          : entry);
       for (const skill of videoSkills) {
         expect(contextText).toContain(skill.name);
         expect(contextText).toContain(skill.description);
-        expect(contextText).toContain(skill.path);
+        expect(expandedCatalog).toContain(await realpath(skill.path));
         expect(contextText).not.toContain(skill.instructions);
       }
       const fragments = body.input.flatMap((message) => isRecord(message) && message.role === "developer" && Array.isArray(message.content) ? message.content : [])
@@ -933,14 +1120,17 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
       process.stdout.write(JSON.stringify({ id: message.id, error: { code: -32602, message: "provider filter not disabled" } }) + "\n");
       return;
     }
-    if (JSON.stringify(message.params.sourceKinds) !== JSON.stringify(["cli", "vscode"])) {
-      process.stdout.write(JSON.stringify({ id: message.id, error: { code: -32602, message: "interactive sources not requested" } }) + "\n");
+    if (JSON.stringify(message.params.sourceKinds) !== JSON.stringify(["cli", "vscode", "appServer", "subAgent", "subAgentThreadSpawn"])) {
+      process.stdout.write(JSON.stringify({ id: message.id, error: { code: -32602, message: "interactive and native spawned-agent sources not requested" } }) + "\n");
       return;
     }
     process.stdout.write(JSON.stringify({
       id: message.id,
       result: {
-        data: message.params.archived ? [] : [{ id: "thread-1", preview: "Fast task", updatedAt: 42 }],
+        data: message.params.archived ? [] : [
+          { id: "thread-1", preview: "Fast task", updatedAt: 42 },
+          { id: "child-1", parentThreadId: "thread-1", preview: "Research", updatedAt: 41 },
+        ],
         nextCursor: null,
       },
     }) + "\n");
@@ -966,6 +1156,10 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
     try {
       await expect(listCodexHarnessSessions(runtime, workspace, { limit: 200 })).resolves.toEqual([
         expect.objectContaining({ id: "thread-1", title: "Fast task", directory: root, status: { type: "idle" } }),
+        expect.objectContaining({ id: "child-1", parentID: "thread-1", title: "Research" }),
+      ]);
+      await expect(listCodexHarnessSessions(runtime, workspace, { roots: true })).resolves.toEqual([
+        expect.objectContaining({ id: "thread-1" }),
       ]);
     } finally {
       await runtime.close();

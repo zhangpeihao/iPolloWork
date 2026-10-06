@@ -1,3 +1,4 @@
+import { codexNativePlanTodos } from "@ipollowork/types/workspace";
 import type { DynamicToolUIPart, UIMessage } from "ai";
 import { serviceErrorMessage } from "@ipollowork/types/provider-errors";
 import { t } from "@/i18n";
@@ -150,10 +151,25 @@ function userMessageParts(item: Record<string, unknown>): UIMessage["parts"] {
   return [...textParts, ...fileParts];
 }
 
-function toolPart(item: Record<string, unknown>, completed: boolean): DynamicToolUIPart | null {
+function toolPart(item: Record<string, unknown>, completed: boolean, parentSessionId: string): DynamicToolUIPart | null {
   const id = stringValue(item.id);
   if (!id) return null;
   const type = stringValue(item.type);
+  const childSessionId = stringValue(item.agentThreadId);
+  if (type === "subAgentActivity" && childSessionId) {
+    const kind = stringValue(item.kind);
+    const delegationStatus = kind === "completed" ? "completed" : kind === "interrupted" ? "failed" : "running";
+    const shared = {
+      type: "dynamic-tool" as const,
+      toolName: "task",
+      toolCallId: id,
+      input: { description: stringValue(item.agentPath) ?? "", task_id: childSessionId },
+      callProviderMetadata: { ipollowork: { partId: id, sessionId: childSessionId, parentSessionId, nativeTool: "subAgentActivity", nativeKind: kind, delegationStatus } },
+    };
+    if (kind === "interrupted") return { ...shared, state: "output-error", errorText: "Codex interrupted this agent" };
+    if (kind === "completed") return { ...shared, state: "output-available", output: `<task id="${childSessionId}" state="completed"></task>` };
+    return { ...shared, state: "input-streaming" };
+  }
   const toolName = type === "commandExecution"
     ? "bash"
     : type === "fileChange"
@@ -237,7 +253,7 @@ function messageForItem(
       }],
     };
   }
-  const tool = toolPart(item, completed);
+  const tool = toolPart(item, completed, threadId);
   return tool ? { id, role: "assistant", metadata, parts: [tool] } : null;
 }
 
@@ -326,6 +342,11 @@ export function mapCodexHarnessEvent(
   const params = isRecord(event.params) ? event.params : null;
   if (!method || !params) return [];
   const threadId = stringValue(params.threadId);
+  if (method === "turn/plan/updated" && threadId && typeof params.turnId === "string") {
+    const active = state.activeTurnByThread.get(threadId);
+    if (active && active !== params.turnId) return [];
+    return [{ type: "todo.updated", sessionId: threadId, todos: codexNativePlanTodos(threadId, params.turnId, params.plan) }];
+  }
   if (method === "thread/tokenUsage/updated" && threadId && isRecord(params.tokenUsage)) {
     const tokenUsage = params.tokenUsage;
     const last = isRecord(tokenUsage.last)
@@ -395,8 +416,12 @@ export function mapCodexHarnessEvent(
     const hasVisibleResult = turnKey ? state.visibleResultTurns.has(turnKey) : false;
     const completedAt = typeof turn.completedAt === "number" ? turn.completedAt * 1_000 : Date.now();
     const parentUserMessageId = turnKey ? state.parentUserMessageIdByTurn.get(turnKey) : undefined;
+    const hasCompaction = turnKey && [...(state.itemsByTurn.get(turnKey) ?? [])]
+      .some((id) => state.itemKinds.get(id) === "contextCompaction");
     const completed = turnId
-      ? [...(state.itemsByTurn.get(`${threadId}:${turnId}`) ?? [])].map((messageId): ConversationEvent => ({
+      ? [...(state.itemsByTurn.get(`${threadId}:${turnId}`) ?? [])]
+        .filter((id) => state.itemKinds.get(id) !== "contextCompaction")
+        .map((messageId): ConversationEvent => ({
           type: "message.completed",
           sessionId: threadId,
           messageId,
@@ -412,6 +437,7 @@ export function mapCodexHarnessEvent(
     const activeTurnId = state.activeTurnByThread.get(threadId);
     const supersededByNewTurn = Boolean(turnId && activeTurnId && activeTurnId !== turnId);
     if (supersededByNewTurn) return completed;
+    if (hasCompaction) completed.push({ type: "session.compaction", sessionId: threadId, running: false });
     state.retryingThreads.delete(threadId);
     if (!turnId || activeTurnId === turnId) state.activeTurnByThread.delete(threadId);
     if (turn.status === "failed") {
@@ -422,7 +448,7 @@ export function mapCodexHarnessEvent(
         errorText: serviceErrorMessage(turn.error, error ?? "Codex 处理失败，请稍后重试。"),
         ...(parentUserMessageId ? { parentUserMessageId } : {}),
       });
-    } else if (turn.status === "completed" && !hasVisibleResult) {
+    } else if (turn.status === "completed" && !hasVisibleResult && !(hasCompaction && !parentUserMessageId)) {
       completed.push({
         type: "session.error",
         sessionId: threadId,
@@ -456,6 +482,9 @@ export function mapCodexHarnessEvent(
       const items = state.itemsByTurn.get(turnKey) ?? new Set<string>();
       items.add(id);
       state.itemsByTurn.set(turnKey, items);
+    }
+    if (item.type === "contextCompaction") {
+      return [{ type: "session.compaction", sessionId: threadId, running: method === "item/started" }];
     }
     if (!message) return [];
     if (
